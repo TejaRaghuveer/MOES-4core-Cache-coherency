@@ -14,7 +14,7 @@ module cache_controller #(
 
     // CPU side
     input  logic                  core_req_valid,
-    input  logic                  core_req_type,   // 0=READ, 1=WRITE
+    input  logic [1:0]            core_req_type,   // 2'b01=READ, 2'b10=WRITE, 2'b11=UPGRADE?
     input  logic [ADDR_WIDTH-1:0] core_addr,
     input  logic [DATA_WIDTH-1:0] core_wdata,
     output logic                  core_resp_valid,
@@ -24,6 +24,7 @@ module cache_controller #(
     output logic                  bus_req_valid,
     output logic [1:0]            bus_req_type,     // BusRd/BusRdX/BusUpgr
     output logic [ADDR_WIDTH-1:0] bus_req_addr,
+    input  logic                  bus_req_ready,
 
     // Snoop inputs
     input  logic [1:0]            snoop_type,       // 2'b01=READ, 2'b10=WRITE, 2'b11=UPGRADE
@@ -40,6 +41,10 @@ module cache_controller #(
 
     logic [INDEX_BITS-1:0] req_set;
     logic [TAG_WIDTH-1:0]  req_tag;
+
+    localparam logic [1:0] BUS_READ  = 2'b01;
+    localparam logic [1:0] BUS_WRITE = 2'b10; // BusRdX
+    localparam logic [1:0] BUS_UPGR  = 2'b11; // BusUpgr
 
     assign req_set = core_addr[OFFSET_BITS +: INDEX_BITS];
     assign req_tag = core_addr[ADDR_WIDTH-1 -: TAG_WIDTH];
@@ -102,6 +107,31 @@ module cache_controller #(
 
     logic                          snoop_tag_match;
     logic                          snoop_line_valid;
+
+    // -------------------------------------------------------------------------
+    // Read path FSM (IDLE, WAIT_MEM)
+    // -------------------------------------------------------------------------
+    typedef enum logic {IDLE, WAIT_MEM} rd_state_t;
+    rd_state_t rd_state, rd_state_n;
+    logic [ADDR_WIDTH-1:0] pending_addr;
+    logic [INDEX_BITS-1:0] pending_set;
+    logic [TAG_WIDTH-1:0]  pending_tag;
+
+    // -------------------------------------------------------------------------
+    // Write path FSM (IDLE, WAIT_BUS, UPDATE_LINE)
+    // -------------------------------------------------------------------------
+    typedef enum logic [1:0] {W_IDLE, W_WAIT_BUS, W_UPDATE_LINE} wr_state_t;
+    wr_state_t wr_state, wr_state_n;
+    logic [ADDR_WIDTH-1:0] pending_waddr;
+    logic [INDEX_BITS-1:0] pending_wset;
+    logic [TAG_WIDTH-1:0]  pending_wtag;
+    logic [$clog2(WAYS)-1:0] pending_wway;
+
+    // Tag match / hit signals
+    logic                  rd_hit;
+    logic [$clog2(WAYS)-1:0] rd_hit_way;
+    logic [2:0]            rd_hit_state;
+    integer                w;
 
     // -------------------------------------------------------------------------
     // Instantiate tag array
@@ -210,6 +240,110 @@ module cache_controller #(
     // TODO: Update state using snoop_new_state; if must_invalidate, clear valid.
     // TODO: If snoop_provide_data, place data on bus (not shown).
 
+    // Hit detection for current request set
+    always_comb begin
+        rd_hit       = 1'b0;
+        rd_hit_way   = '0;
+        rd_hit_state = 3'b000;
+        for (w = 0; w < WAYS; w = w + 1) begin
+            if (tag_read_valids[w] && (tag_read_tags[w] == req_tag)) begin
+                if (!rd_hit) begin
+                    rd_hit       = 1'b1;
+                    rd_hit_way   = w[$clog2(WAYS)-1:0];
+                    rd_hit_state = tag_read_states[w];
+                end
+            end
+        end
+    end
+
+    // Read FSM sequential logic
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rd_state     <= IDLE;
+            pending_addr <= '0;
+            pending_set  <= '0;
+            pending_tag  <= '0;
+        end else begin
+            rd_state <= rd_state_n;
+            if (rd_state == IDLE && core_req_valid && core_req_type == BUS_READ && !rd_hit) begin
+                // Latch pending miss request
+                pending_addr <= core_addr;
+                pending_set  <= req_set;
+                pending_tag  <= req_tag;
+            end
+        end
+    end
+
+    // Write FSM sequential logic
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wr_state      <= W_IDLE;
+            pending_waddr <= '0;
+            pending_wset  <= '0;
+            pending_wtag  <= '0;
+            pending_wway  <= '0;
+        end else begin
+            wr_state <= wr_state_n;
+            if (wr_state == W_IDLE && core_req_valid && core_req_type == BUS_WRITE) begin
+                pending_waddr <= core_addr;
+                pending_wset  <= req_set;
+                pending_wtag  <= req_tag;
+                pending_wway  <= rd_hit_way;
+            end
+        end
+    end
+
+    // Read FSM combinational next-state
+    always_comb begin
+        rd_state_n = rd_state;
+        case (rd_state)
+            IDLE: begin
+                if (core_req_valid && core_req_type == BUS_READ && !rd_hit) begin
+                    rd_state_n = WAIT_MEM; // miss pending
+                end
+            end
+            WAIT_MEM: begin
+                // TODO: replace bus_req_ready with memory response valid
+                if (bus_req_ready) begin
+                    rd_state_n = IDLE;
+                end
+            end
+            default: rd_state_n = IDLE;
+        endcase
+    end
+
+    // Write FSM combinational next-state
+    always_comb begin
+        wr_state_n = wr_state;
+        case (wr_state)
+            W_IDLE: begin
+                if (core_req_valid && core_req_type == BUS_WRITE) begin
+                    if (rd_hit) begin
+                        // Hit: may need bus upgrade for S/O
+                        if (rd_hit_state == 3'b101 || rd_hit_state == 3'b010) begin
+                            wr_state_n = W_WAIT_BUS;
+                        end else begin
+                            wr_state_n = W_UPDATE_LINE;
+                        end
+                    end else begin
+                        // Miss: request bus write (RdX)
+                        wr_state_n = W_WAIT_BUS;
+                    end
+                end
+            end
+            W_WAIT_BUS: begin
+                if (bus_req_ready) begin
+                    wr_state_n = W_UPDATE_LINE;
+                end
+            end
+            W_UPDATE_LINE: begin
+                // One-cycle update placeholder
+                wr_state_n = W_IDLE;
+            end
+            default: wr_state_n = W_IDLE;
+        endcase
+    end
+
     // Placeholder defaults to avoid latches in skeleton
     always_comb begin
         core_resp_valid = 1'b0;
@@ -230,7 +364,7 @@ module cache_controller #(
 
         // Default data array controls
         data_read_set   = req_set;
-        data_read_way   = '0;
+        data_read_way   = rd_hit_way;
         data_write_set  = req_set;
         data_write_way  = '0;
         data_write_data = core_wdata;
@@ -252,7 +386,91 @@ module cache_controller #(
         snoop_line_valid = 1'b0;
 
         // Default curr_state (will be set from tag match)
-        curr_state       = 3'b000;
+        curr_state       = rd_hit ? rd_hit_state : 3'b000;
+
+        // ---------------------------------------------------------------------
+        // Read path behavior (IDLE / WAIT_MEM)
+        // ---------------------------------------------------------------------
+        if (rd_state == IDLE) begin
+            if (core_req_valid && core_req_type == BUS_READ) begin
+                if (rd_hit) begin
+                    // Read hit: return data immediately
+                    local_read_hit = 1'b1;
+                    core_resp_valid = 1'b1;
+                    core_rdata = data_read_data;
+
+                    // Update LRU on hit
+                    lru_access_valid = 1'b1;
+                    lru_access_way   = rd_hit_way;
+                end else begin
+                    // Read miss: issue bus read request
+                    local_read_miss = 1'b1;
+                    bus_req_valid   = 1'b1;
+                    bus_req_type    = BUS_READ;
+                    bus_req_addr    = core_addr;
+                end
+            end
+        end else begin
+            // WAIT_MEM: keep asserting bus request until response
+            bus_req_valid = 1'b1;
+            bus_req_type  = BUS_READ;
+            bus_req_addr  = pending_addr;
+
+            if (bus_req_ready) begin
+                // TODO: replace with memory/bus response data
+                core_resp_valid = 1'b1;
+                core_rdata      = '0;
+            end
+        end
+
+        // ---------------------------------------------------------------------
+        // Write path behavior (IDLE / WAIT_BUS / UPDATE_LINE)
+        // ---------------------------------------------------------------------
+        if (wr_state == W_IDLE) begin
+            if (core_req_valid && core_req_type == BUS_WRITE) begin
+                if (rd_hit) begin
+                    // Write hit: call MOESI FSM with local_write_hit
+                    local_write_hit = 1'b1;
+                    // If hit state is S/O, request bus upgrade
+                    if (rd_hit_state == 3'b101 || rd_hit_state == 3'b010) begin
+                        bus_req_valid = 1'b1;
+                        bus_req_type  = BUS_UPGR;
+                        bus_req_addr  = core_addr;
+                    end
+                end else begin
+                    // Write miss: call MOESI FSM with local_write_miss, request BusRdX
+                    local_write_miss = 1'b1;
+                    bus_req_valid    = 1'b1;
+                    bus_req_type     = BUS_WRITE;
+                    bus_req_addr     = core_addr;
+                end
+            end
+        end else if (wr_state == W_WAIT_BUS) begin
+            // Keep asserting bus request during wait
+            bus_req_valid = 1'b1;
+            bus_req_type  = rd_hit ? BUS_UPGR : BUS_WRITE;
+            bus_req_addr  = pending_waddr;
+        end else begin
+            // UPDATE_LINE: update data/tag/LRU for write hit/miss
+            // TODO: merge write data for partial write; assume full-line write for now.
+            data_write_set  = pending_wset;
+            data_write_way  = pending_wway;
+            data_write_data = core_wdata;
+            data_write_mask = {LINE_BYTES{1'b1}};
+
+            tag_write_en    = 1'b1;
+            tag_write_set   = pending_wset;
+            tag_write_way   = pending_wway;
+            tag_write_tag   = pending_wtag;
+            tag_write_valid = 1'b1;
+            tag_write_state = next_state; // from MOESI FSM
+            tag_write_lru   = 2'b00; // TODO: update via LRU logic
+
+            lru_access_valid = 1'b1;
+            lru_access_way   = pending_wway;
+
+            core_resp_valid  = 1'b1;
+        end
     end
 
 endmodule
