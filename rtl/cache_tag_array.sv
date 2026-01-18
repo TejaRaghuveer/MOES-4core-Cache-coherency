@@ -14,12 +14,19 @@ module cache_tag_array #(
     input  logic                         clk,
     input  logic                         rst_n,
 
-    // Read interface: read all ways for a set
-    input  logic [$clog2(SETS)-1:0]       read_set,
-    output logic [WAYS-1:0][TAG_WIDTH-1:0] read_tags,
-    output logic [WAYS-1:0]               read_valids,
-    output logic [WAYS-1:0][2:0]          read_states,
-    output logic [WAYS-1:0][LRU_BITS-1:0] read_lru,
+    // Read interface (core): read all ways for a set
+    input  logic [$clog2(SETS)-1:0]        core_read_set,
+    output logic [WAYS-1:0][TAG_WIDTH-1:0] core_read_tags,
+    output logic [WAYS-1:0]                core_read_valids,
+    output logic [WAYS-1:0][2:0]           core_read_states,
+    output logic [WAYS-1:0][LRU_BITS-1:0]  core_read_lru,
+
+    // Read interface (snoop): read all ways for a set
+    input  logic [$clog2(SETS)-1:0]        snoop_read_set,
+    output logic [WAYS-1:0][TAG_WIDTH-1:0] snoop_read_tags,
+    output logic [WAYS-1:0]                snoop_read_valids,
+    output logic [WAYS-1:0][2:0]           snoop_read_states,
+    output logic [WAYS-1:0][LRU_BITS-1:0]  snoop_read_lru,
 
     // Write interface: update a single way in a set
     input  logic                         write_en,
@@ -68,13 +75,23 @@ module cache_tag_array #(
         end
     end
 
-    // Combinational read of all ways in a set.
+    // Combinational read of all ways in a set (core port).
     always_comb begin
         for (way_i = 0; way_i < WAYS; way_i = way_i + 1) begin
-            read_tags[way_i]   = tag_mem[read_set][way_i];
-            read_valids[way_i] = valid_mem[read_set][way_i];
-            read_states[way_i] = state_mem[read_set][way_i];
-            read_lru[way_i]    = lru_mem[read_set][way_i];
+            core_read_tags[way_i]   = tag_mem[core_read_set][way_i];
+            core_read_valids[way_i] = valid_mem[core_read_set][way_i];
+            core_read_states[way_i] = state_mem[core_read_set][way_i];
+            core_read_lru[way_i]    = lru_mem[core_read_set][way_i];
+        end
+    end
+
+    // Combinational read of all ways in a set (snoop port).
+    always_comb begin
+        for (way_i = 0; way_i < WAYS; way_i = way_i + 1) begin
+            snoop_read_tags[way_i]   = tag_mem[snoop_read_set][way_i];
+            snoop_read_valids[way_i] = valid_mem[snoop_read_set][way_i];
+            snoop_read_states[way_i] = state_mem[snoop_read_set][way_i];
+            snoop_read_lru[way_i]    = lru_mem[snoop_read_set][way_i];
         end
     end
 

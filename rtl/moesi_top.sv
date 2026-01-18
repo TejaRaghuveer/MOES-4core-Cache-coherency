@@ -27,6 +27,8 @@ module moesi_top #(
     logic [NUM_CORES-1:0][1:0]         bus_req_type;
     logic [NUM_CORES-1:0][ADDR_WIDTH-1:0] bus_req_addr;
     logic [NUM_CORES-1:0]              bus_req_ready;
+    logic [NUM_CORES-1:0]              bus_resp_valid;
+    logic [DATA_WIDTH-1:0]             bus_resp_data;
 
     // Coherency bus broadcast
     logic                              bus_valid;
@@ -34,7 +36,7 @@ module moesi_top #(
     logic [1:0]                        bus_type;
     logic [1:0]                        granted_core_id;
 
-    // Snoop response vector (not yet implemented by caches)
+    // Snoop response vector (from caches)
     logic [NUM_CORES-1:0]              snoop_resp;
 
     // Memory interface (placeholder hookup)
@@ -65,7 +67,7 @@ module moesi_top #(
         .snoop_resp(snoop_resp)
     );
 
-    assign snoop_resp = '0; // TODO: connect from cache controllers
+    // snoop_resp driven by cache controllers
 
     // -------------------------------------------------------------------------
     // Shared memory (placeholder: not yet connected to bus)
@@ -88,11 +90,14 @@ module moesi_top #(
         .resp_rdata(mem_resp_rdata)
     );
 
-    // TODO: connect coherency bus to shared memory
-    assign mem_req_valid = 1'b0;
+    // Connect coherency bus to shared memory (read-only for now)
+    assign mem_req_valid = bus_valid;
     assign mem_req_write = 1'b0;
-    assign mem_req_addr  = '0;
+    assign mem_req_addr  = bus_addr;
     assign mem_req_wdata = '0;
+
+    // Route memory response to the granted core
+    assign bus_resp_data = mem_resp_rdata;
 
     // -------------------------------------------------------------------------
     // Cache controllers
@@ -121,14 +126,18 @@ module moesi_top #(
                 .bus_req_type(bus_req_type[i]),
                 .bus_req_addr(bus_req_addr[i]),
                 .bus_req_ready(bus_req_ready[i]),
+                .bus_resp_valid(bus_resp_valid[i]),
+                .bus_resp_data(bus_resp_data),
                 // Snoop inputs
                 .snoop_valid(bus_valid),
                 .snoop_type(bus_type),
-                .snoop_addr(bus_addr)
+                .snoop_addr(bus_addr),
+                .snoop_resp(snoop_resp[i])
             );
 
             // Simple ready: granted core sees ready during broadcast
-            assign bus_req_ready[i] = (bus_valid && (granted_core_id == i[1:0]));
+            assign bus_req_ready[i]  = (bus_valid && (granted_core_id == i[1:0]));
+            assign bus_resp_valid[i] = (mem_resp_valid && (granted_core_id == i[1:0]));
         end
     endgenerate
 

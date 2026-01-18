@@ -25,11 +25,14 @@ module cache_controller #(
     output logic [1:0]            bus_req_type,     // BusRd/BusRdX/BusUpgr
     output logic [ADDR_WIDTH-1:0] bus_req_addr,
     input  logic                  bus_req_ready,
+    input  logic                  bus_resp_valid,
+    input  logic [DATA_WIDTH-1:0] bus_resp_data,
 
     // Snoop inputs
     input  logic [1:0]            snoop_type,       // 2'b01=READ, 2'b10=WRITE, 2'b11=UPGRADE
     input  logic [ADDR_WIDTH-1:0] snoop_addr,
-    input  logic                  snoop_valid
+    input  logic                  snoop_valid,
+    output logic                  snoop_resp
 );
 
     // -------------------------------------------------------------------------
@@ -41,21 +44,30 @@ module cache_controller #(
 
     logic [INDEX_BITS-1:0] req_set;
     logic [TAG_WIDTH-1:0]  req_tag;
+    logic [INDEX_BITS-1:0] snoop_set;
+    logic [TAG_WIDTH-1:0]  snoop_tag;
 
     localparam logic [1:0] BUS_READ  = 2'b01;
     localparam logic [1:0] BUS_WRITE = 2'b10; // BusRdX
     localparam logic [1:0] BUS_UPGR  = 2'b11; // BusUpgr
 
-    assign req_set = core_addr[OFFSET_BITS +: INDEX_BITS];
-    assign req_tag = core_addr[ADDR_WIDTH-1 -: TAG_WIDTH];
+    assign req_set   = core_addr[OFFSET_BITS +: INDEX_BITS];
+    assign req_tag   = core_addr[ADDR_WIDTH-1 -: TAG_WIDTH];
+    assign snoop_set = snoop_addr[OFFSET_BITS +: INDEX_BITS];
+    assign snoop_tag = snoop_addr[ADDR_WIDTH-1 -: TAG_WIDTH];
 
     // -------------------------------------------------------------------------
     // Tag array signals
     // -------------------------------------------------------------------------
-    logic [WAYS-1:0][TAG_WIDTH-1:0] tag_read_tags;
-    logic [WAYS-1:0]               tag_read_valids;
-    logic [WAYS-1:0][2:0]          tag_read_states;
-    logic [WAYS-1:0][1:0]          tag_read_lru;
+    logic [WAYS-1:0][TAG_WIDTH-1:0] core_tag_read_tags;
+    logic [WAYS-1:0]                core_tag_read_valids;
+    logic [WAYS-1:0][2:0]           core_tag_read_states;
+    logic [WAYS-1:0][1:0]           core_tag_read_lru;
+
+    logic [WAYS-1:0][TAG_WIDTH-1:0] snoop_tag_read_tags;
+    logic [WAYS-1:0]                snoop_tag_read_valids;
+    logic [WAYS-1:0][2:0]           snoop_tag_read_states;
+    logic [WAYS-1:0][1:0]           snoop_tag_read_lru;
 
     logic                          tag_write_en;
     logic [INDEX_BITS-1:0]         tag_write_set;
@@ -116,6 +128,9 @@ module cache_controller #(
     logic [ADDR_WIDTH-1:0] pending_addr;
     logic [INDEX_BITS-1:0] pending_set;
     logic [TAG_WIDTH-1:0]  pending_tag;
+    logic [$clog2(WAYS)-1:0] pending_rway;
+    logic [$clog2(WAYS)-1:0] pending_rhit_way;
+    logic                     rd_resp_pending;
 
     // -------------------------------------------------------------------------
     // Write path FSM (IDLE, WAIT_BUS, UPDATE_LINE)
@@ -131,6 +146,9 @@ module cache_controller #(
     logic                  rd_hit;
     logic [$clog2(WAYS)-1:0] rd_hit_way;
     logic [2:0]            rd_hit_state;
+    logic                  snoop_hit;
+    logic [$clog2(WAYS)-1:0] snoop_hit_way;
+    logic [2:0]            snoop_hit_state;
     integer                w;
 
     // -------------------------------------------------------------------------
@@ -145,11 +163,16 @@ module cache_controller #(
     ) u_tag_array (
         .clk(clk),
         .rst_n(rst_n),
-        .read_set(req_set),
-        .read_tags(tag_read_tags),
-        .read_valids(tag_read_valids),
-        .read_states(tag_read_states),
-        .read_lru(tag_read_lru),
+        .core_read_set(req_set),
+        .core_read_tags(core_tag_read_tags),
+        .core_read_valids(core_tag_read_valids),
+        .core_read_states(core_tag_read_states),
+        .core_read_lru(core_tag_read_lru),
+        .snoop_read_set(snoop_set),
+        .snoop_read_tags(snoop_tag_read_tags),
+        .snoop_read_valids(snoop_tag_read_valids),
+        .snoop_read_states(snoop_tag_read_states),
+        .snoop_read_lru(snoop_tag_read_lru),
         .write_en(tag_write_en),
         .write_set(tag_write_set),
         .write_way(tag_write_way),
@@ -240,17 +263,35 @@ module cache_controller #(
     // TODO: Update state using snoop_new_state; if must_invalidate, clear valid.
     // TODO: If snoop_provide_data, place data on bus (not shown).
 
-    // Hit detection for current request set
+    // Hit detection for current request set (disabled during snoop to avoid false hits)
     always_comb begin
         rd_hit       = 1'b0;
         rd_hit_way   = '0;
         rd_hit_state = 3'b000;
+        if (!snoop_valid) begin
         for (w = 0; w < WAYS; w = w + 1) begin
-            if (tag_read_valids[w] && (tag_read_tags[w] == req_tag)) begin
+            if (core_tag_read_valids[w] && (core_tag_read_tags[w] == req_tag)) begin
                 if (!rd_hit) begin
                     rd_hit       = 1'b1;
                     rd_hit_way   = w[$clog2(WAYS)-1:0];
-                    rd_hit_state = tag_read_states[w];
+                    rd_hit_state = core_tag_read_states[w];
+                end
+            end
+        end
+        end
+    end
+
+    // Snoop hit detection for snoop address
+    always_comb begin
+        snoop_hit = 1'b0;
+        snoop_hit_way = '0;
+        snoop_hit_state = 3'b000;
+        for (w = 0; w < WAYS; w = w + 1) begin
+            if (snoop_tag_read_valids[w] && (snoop_tag_read_tags[w] == snoop_tag)) begin
+                if (!snoop_hit) begin
+                    snoop_hit = 1'b1;
+                    snoop_hit_way = w[$clog2(WAYS)-1:0];
+                    snoop_hit_state = snoop_tag_read_states[w];
                 end
             end
         end
@@ -263,13 +304,24 @@ module cache_controller #(
             pending_addr <= '0;
             pending_set  <= '0;
             pending_tag  <= '0;
+            pending_rway <= '0;
+            pending_rhit_way <= '0;
+            rd_resp_pending <= 1'b0;
         end else begin
             rd_state <= rd_state_n;
-            if (rd_state == IDLE && core_req_valid && core_req_type == BUS_READ && !rd_hit) begin
+            if (!snoop_valid && rd_state == IDLE && core_req_valid && core_req_type == BUS_READ && !rd_hit) begin
                 // Latch pending miss request
                 pending_addr <= core_addr;
                 pending_set  <= req_set;
                 pending_tag  <= req_tag;
+                pending_rway <= lru_victim_way;
+            end
+            // Track one-cycle delayed read hit response
+            if (!snoop_valid && rd_state == IDLE && core_req_valid && core_req_type == BUS_READ && rd_hit) begin
+                rd_resp_pending <= 1'b1;
+                pending_rhit_way <= rd_hit_way;
+            end else begin
+                rd_resp_pending <= 1'b0;
             end
         end
     end
@@ -303,8 +355,7 @@ module cache_controller #(
                 end
             end
             WAIT_MEM: begin
-                // TODO: replace bus_req_ready with memory response valid
-                if (bus_req_ready) begin
+                if (bus_resp_valid) begin
                     rd_state_n = IDLE;
                 end
             end
@@ -363,8 +414,8 @@ module cache_controller #(
         tag_write_lru   = 2'b00;
 
         // Default data array controls
-        data_read_set   = req_set;
-        data_read_way   = rd_hit_way;
+        data_read_set   = snoop_valid ? snoop_set : req_set;
+        data_read_way   = rd_resp_pending ? pending_rhit_way : rd_hit_way;
         data_write_set  = req_set;
         data_write_way  = '0;
         data_write_data = core_wdata;
@@ -384,9 +435,11 @@ module cache_controller #(
         // Default snoop inputs
         snoop_tag_match  = 1'b0;
         snoop_line_valid = 1'b0;
+        snoop_resp       = 1'b0;
 
         // Default curr_state (will be set from tag match)
-        curr_state       = rd_hit ? rd_hit_state : 3'b000;
+        curr_state       = snoop_valid ? (snoop_hit ? snoop_hit_state : 3'b000)
+                                        : (rd_hit ? rd_hit_state : 3'b000);
 
         // ---------------------------------------------------------------------
         // Read path behavior (IDLE / WAIT_MEM)
@@ -394,14 +447,8 @@ module cache_controller #(
         if (rd_state == IDLE) begin
             if (core_req_valid && core_req_type == BUS_READ) begin
                 if (rd_hit) begin
-                    // Read hit: return data immediately
+                    // Read hit: trigger MOESI and respond next cycle (data array is registered)
                     local_read_hit = 1'b1;
-                    core_resp_valid = 1'b1;
-                    core_rdata = data_read_data;
-
-                    // Update LRU on hit
-                    lru_access_valid = 1'b1;
-                    lru_access_way   = rd_hit_way;
                 end else begin
                     // Read miss: issue bus read request
                     local_read_miss = 1'b1;
@@ -416,11 +463,35 @@ module cache_controller #(
             bus_req_type  = BUS_READ;
             bus_req_addr  = pending_addr;
 
-            if (bus_req_ready) begin
-                // TODO: replace with memory/bus response data
-                core_resp_valid = 1'b1;
-                core_rdata      = '0;
+            if (bus_resp_valid) begin
+                // Fill line on response
+                data_write_set  = pending_set;
+                data_write_way  = pending_rway;
+                data_write_data = bus_resp_data;
+                data_write_mask = {LINE_BYTES{1'b1}};
+
+                tag_write_en    = 1'b1;
+                tag_write_set   = pending_set;
+                tag_write_way   = pending_rway;
+                tag_write_tag   = pending_tag;
+                tag_write_valid = 1'b1;
+                tag_write_state = next_state; // from MOESI FSM (I->E)
+                tag_write_lru   = 2'b00; // TODO: update via LRU logic
+
+                lru_access_valid = 1'b1;
+                lru_access_way   = pending_rway;
+
+                core_resp_valid  = 1'b1;
+                core_rdata       = bus_resp_data;
             end
+        end
+
+        // Read hit response (one-cycle delayed)
+        if (rd_resp_pending) begin
+            core_resp_valid = 1'b1;
+            core_rdata      = data_read_data;
+            lru_access_valid = 1'b1;
+            lru_access_way   = pending_rhit_way;
         end
 
         // ---------------------------------------------------------------------
@@ -470,6 +541,25 @@ module cache_controller #(
             lru_access_way   = pending_wway;
 
             core_resp_valid  = 1'b1;
+        end
+
+        // ---------------------------------------------------------------------
+        // Snoop handling (tag match + response only; state update TODO)
+        // ---------------------------------------------------------------------
+        if (snoop_valid) begin
+            snoop_tag_match  = snoop_hit;
+            snoop_line_valid = snoop_hit;
+            snoop_resp       = snoop_provide_data;
+
+            // Apply snoop state update (highest priority)
+            if (snoop_hit) begin
+                tag_write_en    = 1'b1;
+                tag_write_set   = snoop_set;
+                tag_write_way   = snoop_hit_way;
+                tag_write_tag   = snoop_tag;
+                tag_write_valid = !snoop_must_invalidate;
+                tag_write_state = snoop_new_state;
+            end
         end
     end
 

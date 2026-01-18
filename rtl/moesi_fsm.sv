@@ -84,7 +84,7 @@ module moesi_fsm (
                     cache_invalidated = 1'b1; // BusRdX/Upgr invalidates
                 end else if (snoop_read) begin
                     next_state   = MOESI_S;
-                    provide_data = 1'b0; // E/S do not supply data per spec
+                    provide_data = 1'b1; // E supplies data, downgrade to S
                 end else if (local_write_miss) begin
                     next_state = MOESI_M; // write miss alloc -> M
                 end else if (local_write_hit) begin

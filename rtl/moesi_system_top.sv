@@ -26,6 +26,8 @@ module moesi_system_top #(
     logic [NUM_CORES-1:0][1:0]     bus_req_type;
     logic [NUM_CORES-1:0][ADDR_WIDTH-1:0] bus_req_addr;
     logic [NUM_CORES-1:0]          bus_req_ready;
+    logic [NUM_CORES-1:0]          bus_resp_valid;
+    logic [DATA_WIDTH-1:0]         bus_resp_data;
 
     // Broadcast snoop signals from bus to all caches
     logic                          bus_valid;
@@ -33,7 +35,7 @@ module moesi_system_top #(
     logic [1:0]                    bus_type;
     logic [1:0]                    granted_core_id;
 
-    // Placeholder snoop response vector (not yet implemented by caches)
+    // Snoop response vector (from caches)
     logic [NUM_CORES-1:0]          snoop_resp;
 
     // -------------------------------------------------------------------------
@@ -55,8 +57,9 @@ module moesi_system_top #(
         .snoop_resp(snoop_resp)
     );
 
-    // No snoop response yet (TODO: connect from cache_controller when added)
-    assign snoop_resp = '0;
+    // No memory response in this top (tie off)
+    assign bus_resp_valid = '0;
+    assign bus_resp_data  = '0;
 
     // Generate per-core cache controllers
     genvar i;
@@ -85,11 +88,14 @@ module moesi_system_top #(
                 .bus_req_type(bus_req_type[i]),
                 .bus_req_addr(bus_req_addr[i]),
                 .bus_req_ready(bus_req_ready[i]),
+                .bus_resp_valid(bus_resp_valid[i]),
+                .bus_resp_data(bus_resp_data),
 
                 // Snoop inputs (broadcast)
                 .snoop_valid(bus_valid),
                 .snoop_type(bus_type),
-                .snoop_addr(bus_addr)
+                .snoop_addr(bus_addr),
+                .snoop_resp(snoop_resp[i])
             );
 
             // Simple ready: granted core sees ready during broadcast
