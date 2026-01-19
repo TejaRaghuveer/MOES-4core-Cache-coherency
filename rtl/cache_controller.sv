@@ -98,6 +98,15 @@ module cache_controller #(
     logic [$clog2(WAYS)-1:0]       lru_victim_way;
 
     // -------------------------------------------------------------------------
+    // MOESI encoding (must match documented spec)
+    // -------------------------------------------------------------------------
+    localparam logic [2:0] MOESI_M = 3'b000;
+    localparam logic [2:0] MOESI_O = 3'b001;
+    localparam logic [2:0] MOESI_E = 3'b010;
+    localparam logic [2:0] MOESI_S = 3'b011;
+    localparam logic [2:0] MOESI_I = 3'b100;
+
+    // -------------------------------------------------------------------------
     // MOESI FSM signals
     // -------------------------------------------------------------------------
     logic [2:0]                    curr_state;
@@ -141,6 +150,7 @@ module cache_controller #(
     logic [INDEX_BITS-1:0] pending_wset;
     logic [TAG_WIDTH-1:0]  pending_wtag;
     logic [$clog2(WAYS)-1:0] pending_wway;
+    logic                  pending_wupgr;
 
     // Tag match / hit signals
     logic                  rd_hit;
@@ -267,7 +277,7 @@ module cache_controller #(
     always_comb begin
         rd_hit       = 1'b0;
         rd_hit_way   = '0;
-        rd_hit_state = 3'b000;
+        rd_hit_state = MOESI_I;
         if (!snoop_valid) begin
         for (w = 0; w < WAYS; w = w + 1) begin
             if (core_tag_read_valids[w] && (core_tag_read_tags[w] == req_tag)) begin
@@ -285,7 +295,7 @@ module cache_controller #(
     always_comb begin
         snoop_hit = 1'b0;
         snoop_hit_way = '0;
-        snoop_hit_state = 3'b000;
+        snoop_hit_state = MOESI_I;
         for (w = 0; w < WAYS; w = w + 1) begin
             if (snoop_tag_read_valids[w] && (snoop_tag_read_tags[w] == snoop_tag)) begin
                 if (!snoop_hit) begin
@@ -334,13 +344,17 @@ module cache_controller #(
             pending_wset  <= '0;
             pending_wtag  <= '0;
             pending_wway  <= '0;
+            pending_wupgr <= 1'b0;
         end else begin
             wr_state <= wr_state_n;
             if (wr_state == W_IDLE && core_req_valid && core_req_type == BUS_WRITE) begin
                 pending_waddr <= core_addr;
                 pending_wset  <= req_set;
                 pending_wtag  <= req_tag;
-                pending_wway  <= rd_hit_way;
+                // On miss, allocate LRU victim; on hit, use hit way.
+                pending_wway  <= rd_hit ? rd_hit_way : lru_victim_way;
+                // Latch whether this write needs an upgrade (hit in S/O).
+                pending_wupgr <= rd_hit && (rd_hit_state == MOESI_S || rd_hit_state == MOESI_O);
             end
         end
     end
@@ -371,7 +385,7 @@ module cache_controller #(
                 if (core_req_valid && core_req_type == BUS_WRITE) begin
                     if (rd_hit) begin
                         // Hit: may need bus upgrade for S/O
-                        if (rd_hit_state == 3'b101 || rd_hit_state == 3'b010) begin
+                        if (rd_hit_state == MOESI_S || rd_hit_state == MOESI_O) begin
                             wr_state_n = W_WAIT_BUS;
                         end else begin
                             wr_state_n = W_UPDATE_LINE;
@@ -410,12 +424,13 @@ module cache_controller #(
         tag_write_way   = '0;
         tag_write_tag   = req_tag;
         tag_write_valid = 1'b0;
-        tag_write_state = 3'b000;
+        tag_write_state = MOESI_I;
         tag_write_lru   = 2'b00;
 
         // Default data array controls
         data_read_set   = snoop_valid ? snoop_set : req_set;
-        data_read_way   = rd_resp_pending ? pending_rhit_way : rd_hit_way;
+        data_read_way   = snoop_valid ? snoop_hit_way
+                                      : (rd_resp_pending ? pending_rhit_way : rd_hit_way);
         data_write_set  = req_set;
         data_write_way  = '0;
         data_write_data = core_wdata;
@@ -438,13 +453,13 @@ module cache_controller #(
         snoop_resp       = 1'b0;
 
         // Default curr_state (will be set from tag match)
-        curr_state       = snoop_valid ? (snoop_hit ? snoop_hit_state : 3'b000)
-                                        : (rd_hit ? rd_hit_state : 3'b000);
+        curr_state       = snoop_valid ? (snoop_hit ? snoop_hit_state : MOESI_I)
+                                        : (rd_hit ? rd_hit_state : MOESI_I);
 
         // ---------------------------------------------------------------------
         // Read path behavior (IDLE / WAIT_MEM)
         // ---------------------------------------------------------------------
-        if (rd_state == IDLE) begin
+        if (!snoop_valid && rd_state == IDLE) begin
             if (core_req_valid && core_req_type == BUS_READ) begin
                 if (rd_hit) begin
                     // Read hit: trigger MOESI and respond next cycle (data array is registered)
@@ -464,6 +479,9 @@ module cache_controller #(
             bus_req_addr  = pending_addr;
 
             if (bus_resp_valid) begin
+                // Treat response as read miss completion for MOESI FSM
+                local_read_miss = 1'b1;
+
                 // Fill line on response
                 data_write_set  = pending_set;
                 data_write_way  = pending_rway;
@@ -503,7 +521,7 @@ module cache_controller #(
                     // Write hit: call MOESI FSM with local_write_hit
                     local_write_hit = 1'b1;
                     // If hit state is S/O, request bus upgrade
-                    if (rd_hit_state == 3'b101 || rd_hit_state == 3'b010) begin
+                    if (rd_hit_state == MOESI_S || rd_hit_state == MOESI_O) begin
                         bus_req_valid = 1'b1;
                         bus_req_type  = BUS_UPGR;
                         bus_req_addr  = core_addr;
@@ -519,7 +537,7 @@ module cache_controller #(
         end else if (wr_state == W_WAIT_BUS) begin
             // Keep asserting bus request during wait
             bus_req_valid = 1'b1;
-            bus_req_type  = rd_hit ? BUS_UPGR : BUS_WRITE;
+            bus_req_type  = pending_wupgr ? BUS_UPGR : BUS_WRITE;
             bus_req_addr  = pending_waddr;
         end else begin
             // UPDATE_LINE: update data/tag/LRU for write hit/miss

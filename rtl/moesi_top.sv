@@ -28,7 +28,7 @@ module moesi_top #(
     logic [NUM_CORES-1:0][ADDR_WIDTH-1:0] bus_req_addr;
     logic [NUM_CORES-1:0]              bus_req_ready;
     logic [NUM_CORES-1:0]              bus_resp_valid;
-    logic [DATA_WIDTH-1:0]             bus_resp_data;
+    logic [NUM_CORES-1:0][DATA_WIDTH-1:0] bus_resp_data;
 
     // Coherency bus broadcast
     logic                              bus_valid;
@@ -97,7 +97,15 @@ module moesi_top #(
     assign mem_req_wdata = '0;
 
     // Route memory response to the granted core
-    assign bus_resp_data = mem_resp_rdata;
+    // Per-core data routing based on grant
+    genvar k;
+    generate
+        for (k = 0; k < NUM_CORES; k = k + 1) begin : gen_resp_data
+            assign bus_resp_data[k] = (mem_resp_valid && (granted_core_id == k[1:0]))
+                                      ? mem_resp_rdata
+                                      : '0;
+        end
+    endgenerate
 
     // -------------------------------------------------------------------------
     // Cache controllers
@@ -127,7 +135,7 @@ module moesi_top #(
                 .bus_req_addr(bus_req_addr[i]),
                 .bus_req_ready(bus_req_ready[i]),
                 .bus_resp_valid(bus_resp_valid[i]),
-                .bus_resp_data(bus_resp_data),
+                .bus_resp_data(bus_resp_data[i]),
                 // Snoop inputs
                 .snoop_valid(bus_valid),
                 .snoop_type(bus_type),

@@ -39,11 +39,11 @@ module cache_tag_array #(
 );
 
     // MOESI encoding (explicit, as requested)
-    localparam logic [2:0] MOESI_M = 3'b001;
-    localparam logic [2:0] MOESI_O = 3'b010;
-    localparam logic [2:0] MOESI_E = 3'b100;
-    localparam logic [2:0] MOESI_S = 3'b101;
-    localparam logic [2:0] MOESI_I = 3'b000;
+    localparam logic [2:0] MOESI_M = 3'b000;
+    localparam logic [2:0] MOESI_O = 3'b001;
+    localparam logic [2:0] MOESI_E = 3'b010;
+    localparam logic [2:0] MOESI_S = 3'b011;
+    localparam logic [2:0] MOESI_I = 3'b100;
 
     // Storage arrays: [set][way]
     logic [TAG_WIDTH-1:0]   tag_mem   [0:SETS-1][0:WAYS-1];

@@ -84,6 +84,7 @@ package moesi_pkg;
             moesi_request req;
             int unsigned  r;
             int unsigned  i;
+            bit [1:0]     desired_type;
 
             for (i = 0; i < num_trans; i++) begin
                 req = moesi_request::type_id::create("req");
@@ -91,15 +92,16 @@ package moesi_pkg;
                 // Pick request type based on ratios
                 r = $urandom_range(0, 99);
                 if (r < read_ratio) begin
-                    req.req_type = 2'b01; // READ
+                    desired_type = 2'b01; // READ
                 end else if (r < (read_ratio + write_ratio)) begin
-                    req.req_type = 2'b10; // WRITE
+                    desired_type = 2'b10; // WRITE
                 end else begin
-                    req.req_type = 2'b11; // UPGRADE
+                    desired_type = 2'b11; // UPGRADE
                 end
+                req.req_type = desired_type;
 
                 // Randomize remaining fields
-                if (!req.randomize() with { req.req_type == req.req_type; }) begin
+                if (!req.randomize() with { req.req_type == desired_type; }) begin
                     `uvm_warning("MOESI_SEQ", "Request randomization failed")
                 end
 

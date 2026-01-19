@@ -1,6 +1,6 @@
 // moesi_fsm.sv
 // Combinational MOESI next-state logic based on local and snoop events.
-// Encoding: M=3'b001, O=3'b010, E=3'b100, S=3'b101, I=3'b000
+    // Encoding: M=3'b000, O=3'b001, E=3'b010, S=3'b011, I=3'b100
 
 module moesi_fsm (
     input  logic [2:0] curr_state,
@@ -17,11 +17,11 @@ module moesi_fsm (
 );
 
     // MOESI encoding (as requested)
-    localparam logic [2:0] MOESI_M = 3'b001;
-    localparam logic [2:0] MOESI_O = 3'b010;
-    localparam logic [2:0] MOESI_E = 3'b100;
-    localparam logic [2:0] MOESI_S = 3'b101;
-    localparam logic [2:0] MOESI_I = 3'b000;
+    localparam logic [2:0] MOESI_M = 3'b000;
+    localparam logic [2:0] MOESI_O = 3'b001;
+    localparam logic [2:0] MOESI_E = 3'b010;
+    localparam logic [2:0] MOESI_S = 3'b011;
+    localparam logic [2:0] MOESI_I = 3'b100;
 
     // Default outputs
     always_comb begin

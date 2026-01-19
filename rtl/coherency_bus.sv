@@ -89,11 +89,9 @@ module coherency_bus #(
             end
 
             COMPLETE: begin
-                // Placeholder: could wait for snoop responses here
+                // Placeholder: could wait for snoop responses here.
                 // For now, complete in one cycle.
-                if (snoop_any_resp || !snoop_any_resp) begin
-                    state_n = IDLE;
-                end
+                state_n = IDLE;
             end
 
             default: state_n = IDLE;
