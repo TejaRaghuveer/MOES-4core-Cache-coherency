@@ -151,6 +151,7 @@ module cache_controller #(
     logic [TAG_WIDTH-1:0]  pending_wtag;
     logic [$clog2(WAYS)-1:0] pending_wway;
     logic                  pending_wupgr;
+    logic [2:0]            pending_wstate;
 
     // Tag match / hit signals
     logic                  rd_hit;
@@ -345,6 +346,7 @@ module cache_controller #(
             pending_wtag  <= '0;
             pending_wway  <= '0;
             pending_wupgr <= 1'b0;
+            pending_wstate <= MOESI_I;
         end else begin
             wr_state <= wr_state_n;
             if (wr_state == W_IDLE && core_req_valid && core_req_type == BUS_WRITE) begin
@@ -355,6 +357,8 @@ module cache_controller #(
                 pending_wway  <= rd_hit ? rd_hit_way : lru_victim_way;
                 // Latch whether this write needs an upgrade (hit in S/O).
                 pending_wupgr <= rd_hit && (rd_hit_state == MOESI_S || rd_hit_state == MOESI_O);
+                // Latch desired write state from MOESI FSM (e.g., E->M)
+                pending_wstate <= next_state;
             end
         end
     end
@@ -552,7 +556,7 @@ module cache_controller #(
             tag_write_way   = pending_wway;
             tag_write_tag   = pending_wtag;
             tag_write_valid = 1'b1;
-            tag_write_state = next_state; // from MOESI FSM
+            tag_write_state = pending_wstate; // latched from MOESI FSM at request time
             tag_write_lru   = 2'b00; // TODO: update via LRU logic
 
             lru_access_valid = 1'b1;

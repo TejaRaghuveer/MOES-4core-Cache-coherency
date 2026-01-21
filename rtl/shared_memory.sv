@@ -35,6 +35,7 @@ module shared_memory #(
     logic                     pending_valid;
     logic [INDEX_BITS-1:0]     pending_line;
     logic [$clog2(READ_LATENCY+1)-1:0] pending_cnt;
+    localparam int READ_LAT_INIT = (READ_LATENCY > 0) ? (READ_LATENCY - 1) : 0;
 
     // Ready when no pending read (single outstanding)
     assign req_ready = !pending_valid;
@@ -87,7 +88,7 @@ module shared_memory #(
                     // Queue read with fixed latency
                     pending_valid <= 1'b1;
                     pending_line  <= req_addr[OFFSET_BITS +: INDEX_BITS];
-                    pending_cnt   <= READ_LATENCY[$clog2(READ_LATENCY+1)-1:0];
+                    pending_cnt   <= READ_LAT_INIT[$clog2(READ_LATENCY+1)-1:0];
                 end
             end
 

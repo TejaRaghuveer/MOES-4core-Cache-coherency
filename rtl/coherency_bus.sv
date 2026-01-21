@@ -85,7 +85,7 @@ module coherency_bus #(
                 // Broadcast granted request for one cycle
                 grant_valid_n = 1'b1;
                 state_n       = COMPLETE;
-                rr_ptr_n      = grant_id_n + 2'd1;
+                rr_ptr_n      = (grant_id_n == (NUM_CORES-1)) ? 2'd0 : (grant_id_n + 2'd1);
             end
 
             COMPLETE: begin
