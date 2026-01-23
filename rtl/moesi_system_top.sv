@@ -27,7 +27,7 @@ module moesi_system_top #(
     logic [NUM_CORES-1:0][ADDR_WIDTH-1:0] bus_req_addr;
     logic [NUM_CORES-1:0]          bus_req_ready;
     logic [NUM_CORES-1:0]          bus_resp_valid;
-    logic [DATA_WIDTH-1:0]         bus_resp_data;
+    logic [NUM_CORES-1:0][DATA_WIDTH-1:0] bus_resp_data;
 
     // Broadcast snoop signals from bus to all caches
     logic                          bus_valid;
@@ -37,6 +37,15 @@ module moesi_system_top #(
 
     // Snoop response vector (from caches)
     logic [NUM_CORES-1:0]          snoop_resp;
+
+    // Shared memory interface
+    logic                          mem_req_valid;
+    logic                          mem_req_write;
+    logic [ADDR_WIDTH-1:0]         mem_req_addr;
+    logic [DATA_WIDTH-1:0]         mem_req_wdata;
+    logic                          mem_req_ready;
+    logic                          mem_resp_valid;
+    logic [DATA_WIDTH-1:0]         mem_resp_rdata;
 
     // -------------------------------------------------------------------------
     // Coherency bus
@@ -57,9 +66,32 @@ module moesi_system_top #(
         .snoop_resp(snoop_resp)
     );
 
-    // No memory response in this top (tie off)
-    assign bus_resp_valid = '0;
-    assign bus_resp_data  = '0;
+    // Shared memory (simple model)
+    shared_memory #(
+        .MEM_BYTES(8 * 1024 * 1024),
+        .LINE_BYTES(LINE_BYTES),
+        .ADDR_WIDTH(ADDR_WIDTH),
+        .DATA_WIDTH(DATA_WIDTH),
+        .READ_LATENCY(4)
+    ) u_mem (
+        .clk(clk),
+        .rst_n(rst_n),
+        .req_valid(mem_req_valid),
+        .req_write(mem_req_write),
+        .req_addr(mem_req_addr),
+        .req_wdata(mem_req_wdata),
+        .req_ready(mem_req_ready),
+        .resp_valid(mem_resp_valid),
+        .resp_rdata(mem_resp_rdata)
+    );
+
+    // Connect coherency bus to shared memory (read-only for now)
+    assign mem_req_valid = bus_valid;
+    assign mem_req_write = 1'b0;
+    assign mem_req_addr  = bus_addr;
+    assign mem_req_wdata = '0;
+
+    // Route memory response to the granted core
 
     // Generate per-core cache controllers
     genvar i;
@@ -89,7 +121,7 @@ module moesi_system_top #(
                 .bus_req_addr(bus_req_addr[i]),
                 .bus_req_ready(bus_req_ready[i]),
                 .bus_resp_valid(bus_resp_valid[i]),
-                .bus_resp_data(bus_resp_data),
+                .bus_resp_data(bus_resp_data[i]),
 
                 // Snoop inputs (broadcast)
                 .snoop_valid(bus_valid),
@@ -99,7 +131,11 @@ module moesi_system_top #(
             );
 
             // Simple ready: granted core sees ready during broadcast
-            assign bus_req_ready[i] = (bus_valid && (granted_core_id == i[1:0]));
+            assign bus_req_ready[i]  = (bus_valid && (granted_core_id == i[1:0]));
+            assign bus_resp_valid[i] = (mem_resp_valid && (granted_core_id == i[1:0]));
+            assign bus_resp_data[i]  = (mem_resp_valid && (granted_core_id == i[1:0]))
+                                     ? mem_resp_rdata
+                                     : '0;
         end
     endgenerate
 

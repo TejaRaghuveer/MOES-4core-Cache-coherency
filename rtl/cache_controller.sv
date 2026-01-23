@@ -140,6 +140,9 @@ module cache_controller #(
     logic [$clog2(WAYS)-1:0] pending_rway;
     logic [$clog2(WAYS)-1:0] pending_rhit_way;
     logic                     rd_resp_pending;
+    logic                     pending_resp_valid;
+    logic [DATA_WIDTH-1:0]    pending_resp_data;
+    logic                     consume_pending_resp;
 
     // -------------------------------------------------------------------------
     // Write path FSM (IDLE, WAIT_BUS, UPDATE_LINE)
@@ -161,6 +164,9 @@ module cache_controller #(
     logic [$clog2(WAYS)-1:0] snoop_hit_way;
     logic [2:0]            snoop_hit_state;
     integer                w;
+    logic [$clog2(WAYS)-1:0] victim_way_sel;
+    logic                   victim_is_dirty;
+    logic                   miss_blocked;
 
     // Compute write target state without relying on moesi_fsm timing
     function automatic logic [2:0] write_target_state(input logic [2:0] state_in);
@@ -284,12 +290,11 @@ module cache_controller #(
     // TODO: Update state using snoop_new_state; if must_invalidate, clear valid.
     // TODO: If snoop_provide_data, place data on bus (not shown).
 
-    // Hit detection for current request set (disabled during snoop to avoid false hits)
+    // Hit detection for current request set
     always_comb begin
         rd_hit       = 1'b0;
         rd_hit_way   = '0;
         rd_hit_state = MOESI_I;
-        if (!snoop_valid) begin
         for (w = 0; w < WAYS; w = w + 1) begin
             if (core_tag_read_valids[w] && (core_tag_read_tags[w] == req_tag)) begin
                 if (!rd_hit) begin
@@ -298,7 +303,6 @@ module cache_controller #(
                     rd_hit_state = core_tag_read_states[w];
                 end
             end
-        end
         end
     end
 
@@ -318,6 +322,24 @@ module cache_controller #(
         end
     end
 
+    // Victim selection: avoid dirty (M/O) when possible; fall back to LRU.
+    always_comb begin
+        victim_way_sel = lru_victim_way;
+        victim_is_dirty = (core_tag_read_states[lru_victim_way] == MOESI_M) ||
+                          (core_tag_read_states[lru_victim_way] == MOESI_O);
+        if (victim_is_dirty) begin
+            for (w = 0; w < WAYS; w = w + 1) begin
+                if (core_tag_read_states[w] != MOESI_M &&
+                    core_tag_read_states[w] != MOESI_O) begin
+                    victim_way_sel = w[$clog2(WAYS)-1:0];
+                    victim_is_dirty = 1'b0;
+                    break;
+                end
+            end
+        end
+    end
+    assign miss_blocked = victim_is_dirty;
+
     // Read FSM sequential logic
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -328,14 +350,16 @@ module cache_controller #(
             pending_rway <= '0;
             pending_rhit_way <= '0;
             rd_resp_pending <= 1'b0;
+            pending_resp_valid <= 1'b0;
+            pending_resp_data  <= '0;
         end else begin
             rd_state <= rd_state_n;
-            if (!snoop_valid && rd_state == IDLE && core_req_valid && core_req_type == BUS_READ && !rd_hit) begin
+            if (!snoop_valid && rd_state == IDLE && core_req_valid && core_req_type == BUS_READ && !rd_hit && !miss_blocked) begin
                 // Latch pending miss request
                 pending_addr <= core_addr;
                 pending_set  <= req_set;
                 pending_tag  <= req_tag;
-                pending_rway <= lru_victim_way;
+                pending_rway <= victim_way_sel;
             end
             // Track one-cycle delayed read hit response
             if (!snoop_valid && rd_state == IDLE && core_req_valid && core_req_type == BUS_READ && rd_hit) begin
@@ -343,6 +367,14 @@ module cache_controller #(
                 pending_rhit_way <= rd_hit_way;
             end else begin
                 rd_resp_pending <= 1'b0;
+            end
+
+            // Buffer memory response if tag write port is busy (snoop or write update)
+            if (bus_resp_valid && ((snoop_valid && snoop_hit) || (wr_state == W_UPDATE_LINE))) begin
+                pending_resp_valid <= 1'b1;
+                pending_resp_data  <= bus_resp_data;
+            end else if (consume_pending_resp) begin
+                pending_resp_valid <= 1'b0;
             end
         end
     end
@@ -359,12 +391,13 @@ module cache_controller #(
             pending_wstate <= MOESI_I;
         end else begin
             wr_state <= wr_state_n;
-            if (wr_state == W_IDLE && core_req_valid && core_req_type == BUS_WRITE) begin
+            if (wr_state == W_IDLE && core_req_valid && core_req_type == BUS_WRITE &&
+                !( !rd_hit && miss_blocked )) begin
                 pending_waddr <= core_addr;
                 pending_wset  <= req_set;
                 pending_wtag  <= req_tag;
                 // On miss, allocate LRU victim; on hit, use hit way.
-                pending_wway  <= rd_hit ? rd_hit_way : lru_victim_way;
+                pending_wway  <= rd_hit ? rd_hit_way : victim_way_sel;
                 // Latch whether this write needs an upgrade (hit in S/O).
                 pending_wupgr <= rd_hit && (rd_hit_state == MOESI_S || rd_hit_state == MOESI_O);
                 // Latch desired write state directly from current line state
@@ -378,12 +411,12 @@ module cache_controller #(
         rd_state_n = rd_state;
         case (rd_state)
             IDLE: begin
-                if (core_req_valid && core_req_type == BUS_READ && !rd_hit) begin
+                if (core_req_valid && core_req_type == BUS_READ && !rd_hit && !miss_blocked) begin
                     rd_state_n = WAIT_MEM; // miss pending
                 end
             end
             WAIT_MEM: begin
-                if (bus_resp_valid) begin
+                if (pending_resp_valid || (bus_resp_valid && !(snoop_valid && snoop_hit) && (wr_state != W_UPDATE_LINE))) begin
                     rd_state_n = IDLE;
                 end
             end
@@ -416,8 +449,8 @@ module cache_controller #(
                 end
             end
             W_UPDATE_LINE: begin
-                // One-cycle update placeholder
-                wr_state_n = W_IDLE;
+                // Defer local update if a snoop hit needs the tag write port.
+                wr_state_n = snoop_hit ? W_UPDATE_LINE : W_IDLE;
             end
             default: wr_state_n = W_IDLE;
         endcase
@@ -443,8 +476,8 @@ module cache_controller #(
 
         // Default data array controls
         data_read_set   = snoop_valid ? snoop_set : req_set;
-        data_read_way   = snoop_valid ? snoop_hit_way
-                                      : (rd_resp_pending ? pending_rhit_way : rd_hit_way);
+        data_read_way   = rd_resp_pending ? pending_rhit_way
+                                          : (snoop_valid ? snoop_hit_way : rd_hit_way);
         data_write_set  = req_set;
         data_write_way  = '0;
         data_write_data = core_wdata;
@@ -465,6 +498,7 @@ module cache_controller #(
         snoop_tag_match  = 1'b0;
         snoop_line_valid = 1'b0;
         snoop_resp       = 1'b0;
+        consume_pending_resp = 1'b0;
 
         // Default curr_state (will be set from tag match)
         curr_state       = snoop_valid ? (snoop_hit ? snoop_hit_state : MOESI_I)
@@ -478,12 +512,14 @@ module cache_controller #(
                 if (rd_hit) begin
                     // Read hit: trigger MOESI and respond next cycle (data array is registered)
                     local_read_hit = 1'b1;
-                end else begin
+                end else if (!miss_blocked) begin
                     // Read miss: issue bus read request
                     local_read_miss = 1'b1;
                     bus_req_valid   = 1'b1;
                     bus_req_type    = BUS_READ;
                     bus_req_addr    = core_addr;
+                end else begin
+                    // TODO: dirty victim requires writeback; stall until supported.
                 end
             end
         end else begin
@@ -492,14 +528,14 @@ module cache_controller #(
             bus_req_type  = BUS_READ;
             bus_req_addr  = pending_addr;
 
-            if (bus_resp_valid) begin
+            if (pending_resp_valid || (bus_resp_valid && !(snoop_valid && snoop_hit) && (wr_state != W_UPDATE_LINE))) begin
                 // Treat response as read miss completion for MOESI FSM
                 local_read_miss = 1'b1;
 
                 // Fill line on response
                 data_write_set  = pending_set;
                 data_write_way  = pending_rway;
-                data_write_data = bus_resp_data;
+                data_write_data = pending_resp_valid ? pending_resp_data : bus_resp_data;
                 data_write_mask = {LINE_BYTES{1'b1}};
 
                 tag_write_en    = 1'b1;
@@ -514,7 +550,8 @@ module cache_controller #(
                 lru_access_way   = pending_rway;
 
                 core_resp_valid  = 1'b1;
-                core_rdata       = bus_resp_data;
+                core_rdata       = pending_resp_valid ? pending_resp_data : bus_resp_data;
+                consume_pending_resp = pending_resp_valid;
             end
         end
 
@@ -540,12 +577,14 @@ module cache_controller #(
                         bus_req_type  = BUS_UPGR;
                         bus_req_addr  = core_addr;
                     end
-                end else begin
+                end else if (!miss_blocked) begin
                     // Write miss: call MOESI FSM with local_write_miss, request BusRdX
                     local_write_miss = 1'b1;
                     bus_req_valid    = 1'b1;
                     bus_req_type     = BUS_WRITE;
                     bus_req_addr     = core_addr;
+                end else begin
+                    // TODO: dirty victim requires writeback; stall until supported.
                 end
             end
         end else if (wr_state == W_WAIT_BUS) begin
@@ -553,7 +592,7 @@ module cache_controller #(
             bus_req_valid = 1'b1;
             bus_req_type  = pending_wupgr ? BUS_UPGR : BUS_WRITE;
             bus_req_addr  = pending_waddr;
-        end else begin
+        end else if (!snoop_hit) begin
             // UPDATE_LINE: update data/tag/LRU for write hit/miss
             // TODO: merge write data for partial write; assume full-line write for now.
             data_write_set  = pending_wset;
